@@ -170,8 +170,10 @@ class LayerDiffusionForA1111(scripts.Script):
                 type='value'
             )
             
-            gr.HTML('<p style="color: #ff6b6b; font-size: 0.9em; font-weight: bold;">⚠️ Disable Hires Fix when using LayerDiffuse!</p>')
-            gr.HTML('<p style="color: #888; font-size: 0.85em;">Transparent areas appear black in preview. Save the image to get proper transparency.</p>')
+            gr.HTML('<p style="color: #888; font-size: 0.85em;">Generates transparent PNGs. Black areas in preview = transparent when saved.</p>')
+
+            auto_prompt = gr.Checkbox(label='Auto-add transparency prompts', value=True)
+            gr.HTML('<p style="color: #666; font-size: 0.8em; margin-top: -8px;">Adds "transparent_background, simple_background" to positive and "gradient_background, complex_background" to negative.</p>')
 
             with gr.Row():
                 weight = gr.Slider(label="Weight", value=1.0, minimum=0.0, maximum=2.0, step=0.001)
@@ -187,18 +189,50 @@ class LayerDiffusionForA1111(scripts.Script):
             
             output_origin = gr.Checkbox(label='Output original mat for img2img', value=False, visible=False)
 
-        return enabled, method, weight, ending_step, resize_mode, output_origin
+        return enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin
 
-    def process(self, p: StableDiffusionProcessing, enabled, method, weight, ending_step, resize_mode, output_origin):
+    def process(self, p: StableDiffusionProcessing, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin):
         """Called before processing starts - inject LoRA weights."""
         global _latent_storage
         
         if not enabled:
             return
 
-        # Check for Hires Fix and warn
-        if getattr(p, 'enable_hr', False):
-            print('[LayerDiffuse] WARNING: Hires Fix is enabled! LayerDiffuse may not work correctly. Please disable Hires Fix.')
+        # Auto-add transparency prompts if enabled
+        if auto_prompt:
+            positive_addition = "transparent_background, simple_background"
+            negative_addition = "gradient_background, complex_background"
+            
+            # Modify all prompts in the batch
+            if hasattr(p, 'all_prompts') and p.all_prompts:
+                p.all_prompts = [f"{positive_addition}, {prompt}" for prompt in p.all_prompts]
+            if hasattr(p, 'all_negative_prompts') and p.all_negative_prompts:
+                p.all_negative_prompts = [f"{negative_addition}, {neg}" for neg in p.all_negative_prompts]
+            
+            # Also modify the main prompt for display
+            if hasattr(p, 'prompt'):
+                p.prompt = f"{positive_addition}, {p.prompt}"
+            if hasattr(p, 'negative_prompt'):
+                p.negative_prompt = f"{negative_addition}, {p.negative_prompt}"
+            
+            print(f'[LayerDiffuse] Added transparency prompts to positive and negative')
+
+        job_id = id(p)
+        _latent_storage[job_id] = {'latents': None}
+        
+        # Wrap decode_first_stage to capture latents before decoding
+        if not hasattr(shared.sd_model, '_layerdiffuse_original_decode'):
+            original_decode = shared.sd_model.decode_first_stage
+            
+            def wrapped_decode(z, *args, **kwargs):
+                # Capture the latent before decoding (always keep the latest)
+                if isinstance(z, torch.Tensor) and z.shape[1] == 4:  # Latent has 4 channels
+                    _latent_storage[job_id]['latents'] = z.clone().detach().cpu()
+                    print(f'[LayerDiffuse] Intercepted latents at decode: shape={z.shape}')
+                return original_decode(z, *args, **kwargs)
+            
+            shared.sd_model._layerdiffuse_original_decode = original_decode
+            shared.sd_model.decode_first_stage = wrapped_decode
 
         method_enum = LayerMethod(method)
         print(f'[LayerDiffuse] Enabled with method: {method_enum}')
@@ -251,35 +285,12 @@ class LayerDiffusionForA1111(scripts.Script):
             'layerdiffusion_ending_step': ending_step,
         })
 
-    def post_sample(self, p, ps, enabled, method, weight, ending_step, resize_mode, output_origin):
-        """Called after sampling - capture latents."""
-        global _latent_storage
-        
-        if not enabled:
-            return
-        
-        if ps.samples is None:
-            return
-        
-        job_id = getattr(p, 'layerdiffuse_job_id', id(p))
-        
-        if job_id not in _latent_storage:
-            _latent_storage[job_id] = {'latents': None, 'hr_latents': None}
-        
-        samples = ps.samples
-        
-        if getattr(samples, 'already_decoded', False):
-            print('[LayerDiffuse] ERROR: Samples already decoded. Hires Fix is likely enabled - please disable it.')
-            return
-        
-        if not isinstance(samples, torch.Tensor):
-            return
-        
-        samples_clone = samples.clone().detach().cpu()
-        _latent_storage[job_id]['latents'] = samples_clone
-        print(f'[LayerDiffuse] Captured latents: shape={samples_clone.shape}')
+    def post_sample(self, p, ps, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin):
+        """Called after sampling - latents are now captured via decode wrapper instead."""
+        # Latents are captured by the wrapped decode_first_stage function
+        pass
 
-    def postprocess_image(self, p, pp, enabled, method, weight, ending_step, resize_mode, output_origin):
+    def postprocess_image(self, p, pp, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin):
         """Called after each image - decode transparency."""
         global vae_transparent_decoder, _latent_storage
 
@@ -320,7 +331,7 @@ class LayerDiffusionForA1111(scripts.Script):
             latent = storage.get('latents')
             
             if latent is None:
-                print("[LayerDiffuse] WARNING: No latent data. Is Hires Fix enabled? Please disable it.")
+                print("[LayerDiffuse] WARNING: No latent data captured.")
                 return
             
             index = getattr(pp, 'index', 0)
@@ -335,9 +346,17 @@ class LayerDiffusionForA1111(scripts.Script):
             lC, lH, lW = single_latent.shape
             expected_h, expected_w = image.height // 8, image.width // 8
             
-            if abs(lH - expected_h) > 1 or abs(lW - expected_w) > 1:
-                print(f'[LayerDiffuse] Latent size mismatch - this may indicate Hires Fix is enabled.')
-                return
+            # Allow some tolerance for rounding differences
+            if abs(lH - expected_h) > 2 or abs(lW - expected_w) > 2:
+                print(f'[LayerDiffuse] Latent size mismatch: latent={lH}x{lW}, expected={expected_h}x{expected_w}')
+                # Resize latent to match if needed
+                single_latent = torch.nn.functional.interpolate(
+                    single_latent.unsqueeze(0), 
+                    size=(expected_h, expected_w), 
+                    mode='bilinear', 
+                    align_corners=False
+                ).squeeze(0)
+                print(f'[LayerDiffuse] Resized latent to {expected_h}x{expected_w}')
             
             png, vis = vae_transparent_decoder.decode(single_latent, image)
             
@@ -352,11 +371,16 @@ class LayerDiffusionForA1111(scripts.Script):
             import traceback
             traceback.print_exc()
 
-    def postprocess(self, p, processed, enabled, method, weight, ending_step, resize_mode, output_origin):
+    def postprocess(self, p, processed, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin):
         """Called after all processing - cleanup."""
         global _latent_storage
         
         restore_original_weights()
+        
+        # Restore original decode function
+        if hasattr(shared.sd_model, '_layerdiffuse_original_decode'):
+            shared.sd_model.decode_first_stage = shared.sd_model._layerdiffuse_original_decode
+            delattr(shared.sd_model, '_layerdiffuse_original_decode')
         
         if not enabled:
             return
