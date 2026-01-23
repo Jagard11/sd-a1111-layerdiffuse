@@ -1,8 +1,16 @@
 import numpy as np
-from lib_layerdiffusion.enums import ResizeMode
-from backend import memory_management
 import cv2
 import torch
+import sys
+import os
+
+# Use local backend compatibility layer
+ext_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ext_dir not in sys.path:
+    sys.path.insert(0, ext_dir)
+
+from lib_layerdiffusion.enums import ResizeMode
+from backend import memory_management
 
 
 def forge_clip_encode(sd_model, text):

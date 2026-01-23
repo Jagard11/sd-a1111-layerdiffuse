@@ -2,6 +2,13 @@
 
 import torch
 import einops
+import sys
+import os
+
+# Use local backend compatibility layer
+ext_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ext_dir not in sys.path:
+    sys.path.insert(0, ext_dir)
 
 from backend import memory_management, utils, attention
 

@@ -2,16 +2,24 @@ import torch.nn as nn
 import torch
 import cv2
 import numpy as np
+import sys
+import os
 
 from tqdm import tqdm
 from typing import Optional, Tuple
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.unets.unet_2d_blocks import UNetMidBlock2D, get_down_block, get_up_block
-from backend import memory_management
-from backend.patcher.base import ModelPatcher
 from torchvision import transforms
 from PIL import Image
+
+# Use local backend compatibility layer
+ext_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ext_dir not in sys.path:
+    sys.path.insert(0, ext_dir)
+
+from backend import memory_management
+from backend.patcher.base import ModelPatcher
 
 
 def zero_module(module):
