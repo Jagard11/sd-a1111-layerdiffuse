@@ -43,6 +43,7 @@ vae_transparent_decoder = None
 _latent_storage = {}
 
 # Store original weights for restoration
+# Format: {key: (module, original_weight, original_backup_or_None)}
 _original_weights = {}
 
 
@@ -73,7 +74,11 @@ def get_unet_module(model, key_path):
 
 
 def apply_layer_lora_weights(model, lora_state_dict, weight=1.0):
-    """Apply LayerDiffuse LoRA weights to the model."""
+    """Apply LayerDiffuse LoRA weights to the model.
+    
+    IMPORTANT: Also modifies A1111's network_weights_backup so our changes
+    survive A1111's LoRA restore cycles when user has other LoRAs active.
+    """
     global _original_weights
     
     applied_count = 0
@@ -115,35 +120,72 @@ def apply_layer_lora_weights(model, lora_state_dict, weight=1.0):
         
         weight_key = f"{module_path}.weight"
         if weight_key not in _original_weights:
-            _original_weights[weight_key] = (module, module.weight.data.clone())
+            # Store original weight AND original A1111 backup (if any)
+            original_backup = None
+            if hasattr(module, 'network_weights_backup') and module.network_weights_backup is not None:
+                backup = module.network_weights_backup
+                if isinstance(backup, torch.Tensor):
+                    original_backup = backup.clone()
+            _original_weights[weight_key] = (module, module.weight.data.clone(), original_backup)
         
         try:
             delta = torch.mm(lora_down, lora_up) * weight
+            applied = False
+            
             if delta.shape == module.weight.shape:
                 module.weight.data += delta
-                applied_count += 1
+                applied = True
             elif delta.T.shape == module.weight.shape:
-                module.weight.data += delta.T
-                applied_count += 1
-        except:
-            try:
+                delta = delta.T
+                module.weight.data += delta
+                applied = True
+            
+            if not applied:
                 delta = torch.mm(lora_up, lora_down) * weight
                 if delta.shape == module.weight.shape:
                     module.weight.data += delta
-                    applied_count += 1
-            except:
-                pass
+                    applied = True
+            
+            if applied:
+                applied_count += 1
+                
+                # CRITICAL: Also modify A1111's LoRA backup so our changes survive restores!
+                # When user has other LoRAs, A1111 restores from backup on each forward pass.
+                # If we don't also patch the backup, our weights get wiped.
+                if hasattr(module, 'network_weights_backup') and module.network_weights_backup is not None:
+                    backup = module.network_weights_backup
+                    if isinstance(backup, torch.Tensor):
+                        # Add our delta to the backup too
+                        if backup.shape == delta.shape:
+                            module.network_weights_backup = backup + delta.to(backup.device, backup.dtype)
+                    elif isinstance(backup, tuple):
+                        # MultiheadAttention has tuple backup
+                        pass  # Skip MHA for now, less common
+                        
+        except Exception as e:
+            pass  # Skip layers that don't match
     
     print(f'[LayerDiffuse] Applied LoRA weights to {applied_count} layers')
     return applied_count > 0
 
 
 def restore_original_weights():
-    """Restore original UNet weights after generation."""
+    """Restore original UNet weights after generation.
+    
+    Also restores A1111's network_weights_backup if we modified it.
+    """
     global _original_weights
     
-    for key, (module, original_weight) in _original_weights.items():
+    for key, stored_data in _original_weights.items():
+        module, original_weight = stored_data[0], stored_data[1]
+        original_backup = stored_data[2] if len(stored_data) > 2 else None
+        
+        # Restore the actual weight
         module.weight.data.copy_(original_weight)
+        
+        # Restore A1111's backup if we modified it
+        if original_backup is not None and hasattr(module, 'network_weights_backup'):
+            module.network_weights_backup = original_backup
     
     restored_count = len(_original_weights)
     _original_weights.clear()
