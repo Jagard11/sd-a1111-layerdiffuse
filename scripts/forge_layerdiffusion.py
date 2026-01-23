@@ -343,22 +343,49 @@ class LayerDiffusionForA1111(scripts.Script):
             
             single_latent = single_latent.to(devices.get_optimal_device())
             
-            lC, lH, lW = single_latent.shape
-            expected_h, expected_w = image.height // 8, image.width // 8
+            # The UNet1024 decoder has 7 down/up blocks, so image must be divisible by 128
+            # Pad image and latent to compatible sizes, then crop result after
+            orig_h, orig_w = image.height, image.width
+            pad_h = (128 - (orig_h % 128)) % 128
+            pad_w = (128 - (orig_w % 128)) % 128
             
-            # Allow some tolerance for rounding differences
-            if abs(lH - expected_h) > 2 or abs(lW - expected_w) > 2:
-                print(f'[LayerDiffuse] Latent size mismatch: latent={lH}x{lW}, expected={expected_h}x{expected_w}')
-                # Resize latent to match if needed
+            if pad_h > 0 or pad_w > 0:
+                # Pad image (PIL uses left, top, right, bottom for expand)
+                padded_w = orig_w + pad_w
+                padded_h = orig_h + pad_h
+                padded_image = Image.new(image.mode, (padded_w, padded_h), (128, 128, 128))  # Gray padding
+                padded_image.paste(image, (0, 0))
+                
+                # Resize latent to match padded image
+                latent_h, latent_w = padded_h // 8, padded_w // 8
                 single_latent = torch.nn.functional.interpolate(
-                    single_latent.unsqueeze(0), 
-                    size=(expected_h, expected_w), 
-                    mode='bilinear', 
+                    single_latent.unsqueeze(0),
+                    size=(latent_h, latent_w),
+                    mode='bilinear',
                     align_corners=False
                 ).squeeze(0)
-                print(f'[LayerDiffuse] Resized latent to {expected_h}x{expected_w}')
+                
+                print(f'[LayerDiffuse] Padded image from {orig_w}x{orig_h} to {padded_w}x{padded_h}')
+                image = padded_image
+            else:
+                # Still need to ensure latent matches image
+                lC, lH, lW = single_latent.shape
+                expected_h, expected_w = image.height // 8, image.width // 8
+                
+                if abs(lH - expected_h) > 2 or abs(lW - expected_w) > 2:
+                    single_latent = torch.nn.functional.interpolate(
+                        single_latent.unsqueeze(0), 
+                        size=(expected_h, expected_w), 
+                        mode='bilinear', 
+                        align_corners=False
+                    ).squeeze(0)
             
             png, vis = vae_transparent_decoder.decode(single_latent, image)
+            
+            # Crop back to original size if we padded
+            if pad_h > 0 or pad_w > 0:
+                png = png.crop((0, 0, orig_w, orig_h))
+                vis = vis.crop((0, 0, orig_w, orig_h))
             
             pp.image = png if png.mode == 'RGBA' else png.convert('RGBA')
             print(f'[LayerDiffuse] Decoded transparent image')
