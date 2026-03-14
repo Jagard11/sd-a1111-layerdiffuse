@@ -172,7 +172,7 @@ class LayerDiffusionForA1111(scripts.Script):
             
             gr.HTML('<p style="color: #888; font-size: 0.85em;">Generates transparent PNGs. Black areas in preview = transparent when saved.</p>')
 
-            auto_prompt = gr.Checkbox(label='Auto-add transparency prompts', value=True)
+            auto_prompt = gr.Checkbox(label='Auto-add transparency prompts', value=False)
             gr.HTML('<p style="color: #666; font-size: 0.8em; margin-top: -8px;">Adds "transparent_background, simple_background, gray_background" to positive and "gradient_background, complex_background, white background, black background" to negative.</p>')
 
             with gr.Row():
