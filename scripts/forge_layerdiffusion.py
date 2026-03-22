@@ -506,6 +506,12 @@ class LayerDiffusionForA1111(scripts.Script):
         first = init_images[0]
         w, h = first.size
 
+        # Refine pass uses img2img; copied txt2img+hires params include callable
+        # "Hires prompt" / "Hires negative prompt" that require all_hr_* on txt2img only.
+        refine_extra = dict(p.extra_generation_params)
+        refine_extra.pop("Hires prompt", None)
+        refine_extra.pop("Hires negative prompt", None)
+
         p2 = StableDiffusionProcessingImg2Img(
             sd_model=shared.sd_model,
             outpath_samples=p.outpath_samples,
@@ -533,7 +539,7 @@ class LayerDiffusionForA1111(scripts.Script):
             tiling=p.tiling,
             do_not_save_samples=p.do_not_save_samples,
             do_not_save_grid=p.do_not_save_grid,
-            extra_generation_params=dict(p.extra_generation_params),
+            extra_generation_params=refine_extra,
             override_settings=dict(p.override_settings) if p.override_settings else None,
             eta=p.eta,
             ddim_discretize=p.ddim_discretize,
