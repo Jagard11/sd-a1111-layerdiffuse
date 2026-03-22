@@ -151,7 +151,7 @@ def apply_layer_lora_weights(model, lora_state_dict, weight=1.0):
 
 def _apply_transparency_prompts_batch(p: StableDiffusionProcessing, prompts: list, batch_number: int):
     """Prepend transparency tags to this batch's prompts and sync back to all_prompts / all_negative_prompts."""
-    positive_addition = "transparent_background, simple_background, gray_background"
+    positive_addition = "transparent_background, simple_background, grey_background"
     negative_addition = "gradient_background, complex_background, white background, black background"
     bs = p.batch_size
     start = batch_number * bs
@@ -211,7 +211,7 @@ class LayerDiffusionForA1111(scripts.Script):
             gr.HTML('<p style="color: #888; font-size: 0.85em;">Generates transparent PNGs. Black areas in preview = transparent when saved.</p>')
 
             auto_prompt = gr.Checkbox(label='Auto-add transparency prompts', value=False)
-            gr.HTML('<p style="color: #666; font-size: 0.8em; margin-top: -8px;">Adds "transparent_background, simple_background, gray_background" to positive and "gradient_background, complex_background, white background, black background" to negative.</p>')
+            gr.HTML('<p style="color: #666; font-size: 0.8em; margin-top: -8px;">Adds "transparent_background, simple_background, grey_background" to positive and "gradient_background, complex_background, white background, black background" to negative.</p>')
 
             with gr.Row():
                 weight = gr.Slider(label="Weight", value=1.0, minimum=0.0, maximum=2.0, step=0.001)
