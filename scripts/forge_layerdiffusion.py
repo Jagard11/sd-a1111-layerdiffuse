@@ -19,8 +19,8 @@ ext_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ext_dir not in sys.path:
     sys.path.insert(0, ext_dir)
 
-from modules import scripts, shared, devices
-from modules.processing import StableDiffusionProcessing, StableDiffusionProcessingImg2Img
+from modules import scripts, shared, devices, errors
+from modules.processing import StableDiffusionProcessing, StableDiffusionProcessingImg2Img, process_images
 from modules.paths import models_path
 from modules.modelloader import load_file_from_url
 from modules import images
@@ -35,6 +35,17 @@ from backend import utils as backend_utils
 
 layer_model_root = os.path.join(models_path, 'layer_model')
 os.makedirs(layer_model_root, exist_ok=True)
+
+# Neutral grey #808080 — only applied when preparing refine-pass img2img inputs
+NEUTRAL_GREY_RGBA = (128, 128, 128, 255)
+
+
+def composite_rgba_on_neutral_grey(img: Image.Image) -> Image.Image:
+    """Flatten RGBA onto opaque #808080; used only as refine img2img init (not on final gallery output)."""
+    if img.mode != 'RGBA':
+        img = img.convert('RGBA')
+    bg = Image.new('RGBA', img.size, NEUTRAL_GREY_RGBA)
+    return Image.alpha_composite(bg, img)
 
 vae_transparent_encoder = None
 vae_transparent_decoder = None
@@ -216,9 +227,23 @@ class LayerDiffusionForA1111(scripts.Script):
             
             output_origin = gr.Checkbox(label='Output original mat for img2img', value=False, visible=False)
 
-        return enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin
+            refine_second_pass = gr.Checkbox(
+                label='Refine pass (img2img after first pass)',
+                value=True,
+                elem_id='layerdiffuse_refine_second_pass',
+            )
+            refine_denoise = gr.Slider(
+                label='Refine denoise strength',
+                value=0.1,
+                minimum=0.0,
+                maximum=1.0,
+                step=0.01,
+                elem_id='layerdiffuse_refine_denoise',
+            )
 
-    def process(self, p: StableDiffusionProcessing, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin):
+        return enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin, refine_second_pass, refine_denoise
+
+    def process(self, p: StableDiffusionProcessing, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin, refine_second_pass, refine_denoise):
         """Called before processing starts - inject LoRA weights."""
         global _latent_storage
         
@@ -291,6 +316,8 @@ class LayerDiffusionForA1111(scripts.Script):
             'layerdiffusion_method': method,
             'layerdiffusion_weight': weight,
             'layerdiffusion_ending_step': ending_step,
+            'layerdiffusion_refine_second_pass': refine_second_pass,
+            'layerdiffusion_refine_denoise': refine_denoise,
         })
 
     def before_process_batch(
@@ -303,6 +330,8 @@ class LayerDiffusionForA1111(scripts.Script):
         auto_prompt,
         resize_mode,
         output_origin,
+        refine_second_pass,
+        refine_denoise,
         **kwargs,
     ):
         """Runs after each batch's prompts are sliced; must run before extra networks / conditioning."""
@@ -314,12 +343,12 @@ class LayerDiffusionForA1111(scripts.Script):
         batch_number = kwargs.get('batch_number', 0)
         _apply_transparency_prompts_batch(p, prompts, batch_number)
 
-    def post_sample(self, p, ps, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin):
+    def post_sample(self, p, ps, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin, refine_second_pass, refine_denoise):
         """Called after sampling - latents are now captured via decode wrapper instead."""
         # Latents are captured by the wrapped decode_first_stage function
         pass
 
-    def postprocess_image(self, p, pp, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin):
+    def postprocess_image(self, p, pp, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin, refine_second_pass, refine_denoise):
         """Called after each image - decode transparency."""
         global vae_transparent_decoder, _latent_storage
 
@@ -427,20 +456,189 @@ class LayerDiffusionForA1111(scripts.Script):
             import traceback
             traceback.print_exc()
 
-    def postprocess(self, p, processed, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin):
-        """Called after all processing - cleanup."""
+    def _run_refine_pass(self, p, processed, refine_denoise):
+        """Run img2img on first-pass outputs; composite onto #808080 only for the refine init images."""
+        if not processed.images:
+            return
+
+        scripts_img2img = scripts.scripts_img2img
+        self_script = scripts_img2img.script(self.title().lower())
+        if self_script is None:
+            print('[LayerDiffuse] Refine pass skipped: script not found in img2img runner')
+            return
+
+        if getattr(p, 'script_args', None) is None:
+            print('[LayerDiffuse] Refine pass skipped: script_args is None')
+            return
+
+        outer_args = list(p.script_args[self.args_from:self.args_to])
+        inner_args = [getattr(control, 'value', None) if control is not None else None for control in scripts_img2img.inputs]
+
+        if len(outer_args) != (self.args_to - self.args_from):
+            print('[LayerDiffuse] Refine pass skipped: could not read outer script args')
+            return
+
+        if (self_script.args_to - self_script.args_from) != len(outer_args):
+            print(
+                '[LayerDiffuse] Refine pass skipped: LayerDiffuse arg slice mismatch '
+                f'(outer={len(outer_args)}, inner={(self_script.args_to - self_script.args_from)})'
+            )
+            return
+
+        inner_args[self_script.args_from:self_script.args_to] = outer_args
+
+        # Last two controls in this script: refine_second_pass, refine_denoise
+        inner_args[self_script.args_to - 2] = False
+
+        init_images = []
+        source_images = processed.images[processed.index_of_first_image:]
+        if not source_images:
+            print('[LayerDiffuse] Refine pass skipped: no source images after grid prefix')
+            return
+
+        for im in source_images:
+            if not isinstance(im, Image.Image):
+                print('[LayerDiffuse] Refine pass skipped: non-PIL image in result')
+                return
+            # Neutral grey behind transparent/semi-transparent pixels for img2img input only
+            init_images.append(composite_rgba_on_neutral_grey(im).convert('RGB'))
+
+        first = init_images[0]
+        w, h = first.size
+
+        p2 = StableDiffusionProcessingImg2Img(
+            sd_model=shared.sd_model,
+            outpath_samples=p.outpath_samples,
+            outpath_grids=p.outpath_grids,
+            prompt=p.prompt,
+            negative_prompt=p.negative_prompt,
+            styles=p.styles,
+            batch_size=len(init_images),
+            n_iter=1,
+            cfg_scale=p.cfg_scale,
+            width=w,
+            height=h,
+            init_images=init_images,
+            resize_mode=0,
+            denoising_strength=refine_denoise,
+            steps=p.steps,
+            sampler_name=p.sampler_name,
+            scheduler=p.scheduler,
+            seed=p.seed,
+            subseed=p.subseed,
+            subseed_strength=p.subseed_strength,
+            seed_resize_from_h=p.seed_resize_from_h,
+            seed_resize_from_w=p.seed_resize_from_w,
+            restore_faces=p.restore_faces,
+            tiling=p.tiling,
+            do_not_save_samples=p.do_not_save_samples,
+            do_not_save_grid=p.do_not_save_grid,
+            extra_generation_params=dict(p.extra_generation_params),
+            override_settings=dict(p.override_settings) if p.override_settings else None,
+            eta=p.eta,
+            ddim_discretize=p.ddim_discretize,
+            s_churn=p.s_churn,
+            s_tmin=p.s_tmin,
+            s_tmax=p.s_tmax,
+            s_noise=p.s_noise,
+            s_min_uncond=p.s_min_uncond,
+        )
+
+        if hasattr(p, 'tag_enable'):
+            p2.tag_enable = getattr(p, 'tag_enable', None)
+            p2.tag_eta = getattr(p, 'tag_eta', None)
+            p2.tag_enable_ctag = getattr(p, 'tag_enable_ctag', None)
+
+        if getattr(p, 'all_prompts', None):
+            p2.all_prompts = p.all_prompts
+        if getattr(p, 'all_negative_prompts', None):
+            p2.all_negative_prompts = p.all_negative_prompts
+
+        p2.scripts = scripts_img2img
+        p2.script_args = inner_args
+        p2._layerdiffuse_refine_pass = True
+
+        print(f'[LayerDiffuse] Running refine img2img pass on {len(init_images)} image(s) (denoise={refine_denoise})')
+        result = process_images(p2)
+        processed.images = list(result.images)
+        processed.index_of_first_image = result.index_of_first_image
+        if getattr(result, 'infotexts', None):
+            processed.infotexts = result.infotexts
+        if processed.info is not None and getattr(result, 'info', None):
+            processed.info = result.info
+
+    def postprocess(self, p, processed, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin, refine_second_pass, refine_denoise):
+        """Restore UNet / decode hook and latent storage. Refine img2img runs later via patched ScriptRunner (after all other postprocess hooks)."""
         global _latent_storage
-        
+
+        if getattr(p, '_layerdiffuse_refine_pass', False):
+            restore_original_weights()
+            if hasattr(shared.sd_model, '_layerdiffuse_original_decode'):
+                shared.sd_model.decode_first_stage = shared.sd_model._layerdiffuse_original_decode
+                delattr(shared.sd_model, '_layerdiffuse_original_decode')
+            job_id = getattr(p, 'layerdiffuse_job_id', id(p))
+            if job_id in _latent_storage:
+                del _latent_storage[job_id]
+            return
+
         restore_original_weights()
-        
+
         # Restore original decode function
         if hasattr(shared.sd_model, '_layerdiffuse_original_decode'):
             shared.sd_model.decode_first_stage = shared.sd_model._layerdiffuse_original_decode
             delattr(shared.sd_model, '_layerdiffuse_original_decode')
-        
+
         if not enabled:
             return
-        
+
         job_id = getattr(p, 'layerdiffuse_job_id', id(p))
         if job_id in _latent_storage:
             del _latent_storage[job_id]
+
+    def run_layerdiffuse_refine_after_postprocess_chain(
+        self,
+        p,
+        processed,
+        enabled,
+        method,
+        weight,
+        ending_step,
+        auto_prompt,
+        resize_mode,
+        output_origin,
+        refine_second_pass,
+        refine_denoise,
+    ):
+        """Called once after every script's postprocess() so Hires Fix and other refiners run first."""
+        if getattr(p, '_layerdiffuse_refine_pass', False):
+            return
+        if not enabled or not refine_second_pass:
+            return
+        self._run_refine_pass(p, processed, refine_denoise)
+
+
+def _patch_script_runner_for_layerdiffuse_refine_last():
+    """Run LayerDiffuse refine after the full postprocess chain (other extensions, etc.)."""
+    if getattr(scripts.ScriptRunner, '_layerdiffuse_refine_last_patched', False):
+        return
+
+    _orig_postprocess = scripts.ScriptRunner.postprocess
+
+    def postprocess(self, p, processed):
+        _orig_postprocess(self, p, processed)
+        for script in self.alwayson_scripts:
+            if script.__class__.__name__ != 'LayerDiffusionForA1111':
+                continue
+            try:
+                if getattr(p, 'script_args', None) is None:
+                    continue
+                script_args = p.script_args[script.args_from:script.args_to]
+                script.run_layerdiffuse_refine_after_postprocess_chain(p, processed, *script_args)
+            except Exception:
+                errors.report('Error in LayerDiffuse refine pass (after postprocess chain)', exc_info=True)
+
+    scripts.ScriptRunner.postprocess = postprocess
+    scripts.ScriptRunner._layerdiffuse_refine_last_patched = True
+
+
+_patch_script_runner_for_layerdiffuse_refine_last()
