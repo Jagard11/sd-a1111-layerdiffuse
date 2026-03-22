@@ -138,6 +138,33 @@ def apply_layer_lora_weights(model, lora_state_dict, weight=1.0):
     return applied_count > 0
 
 
+def _apply_transparency_prompts_batch(p: StableDiffusionProcessing, prompts: list, batch_number: int):
+    """Prepend transparency tags to this batch's prompts and sync back to all_prompts / all_negative_prompts."""
+    positive_addition = "transparent_background, simple_background, gray_background"
+    negative_addition = "gradient_background, complex_background, white background, black background"
+    bs = p.batch_size
+    start = batch_number * bs
+    for i in range(len(prompts)):
+        prompts[i] = f"{positive_addition}, {prompts[i]}"
+        if start + i < len(p.all_prompts):
+            p.all_prompts[start + i] = prompts[i]
+    if hasattr(p, 'negative_prompts') and p.negative_prompts:
+        for i in range(len(p.negative_prompts)):
+            p.negative_prompts[i] = f"{negative_addition}, {p.negative_prompts[i]}"
+            if start + i < len(p.all_negative_prompts):
+                p.all_negative_prompts[start + i] = p.negative_prompts[i]
+    if batch_number == 0:
+        if p.all_prompts:
+            p.main_prompt = p.all_prompts[0]
+        if p.all_negative_prompts:
+            p.main_negative_prompt = p.all_negative_prompts[0]
+        if hasattr(p, 'prompt') and isinstance(p.prompt, str):
+            p.prompt = p.main_prompt
+        if hasattr(p, 'negative_prompt') and isinstance(p.negative_prompt, str):
+            p.negative_prompt = p.main_negative_prompt
+    print("[LayerDiffuse] Added transparency prompts to positive and negative (batch)")
+
+
 def restore_original_weights():
     """Restore original UNet weights after generation."""
     global _original_weights
@@ -154,7 +181,7 @@ def restore_original_weights():
 
 class LayerDiffusionForA1111(scripts.Script):
     def title(self):
-        return "LayerDiffuse"
+        return "Alpha Injector - LayerDiffuse"
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
@@ -197,25 +224,6 @@ class LayerDiffusionForA1111(scripts.Script):
         
         if not enabled:
             return
-
-        # Auto-add transparency prompts if enabled
-        if auto_prompt:
-            positive_addition = "transparent_background, simple_background, gray_background"
-            negative_addition = "gradient_background, complex_background, white background, black background"
-            
-            # Modify all prompts in the batch
-            if hasattr(p, 'all_prompts') and p.all_prompts:
-                p.all_prompts = [f"{positive_addition}, {prompt}" for prompt in p.all_prompts]
-            if hasattr(p, 'all_negative_prompts') and p.all_negative_prompts:
-                p.all_negative_prompts = [f"{negative_addition}, {neg}" for neg in p.all_negative_prompts]
-            
-            # Also modify the main prompt for display
-            if hasattr(p, 'prompt'):
-                p.prompt = f"{positive_addition}, {p.prompt}"
-            if hasattr(p, 'negative_prompt'):
-                p.negative_prompt = f"{negative_addition}, {p.negative_prompt}"
-            
-            print(f'[LayerDiffuse] Added transparency prompts to positive and negative')
 
         job_id = id(p)
         _latent_storage[job_id] = {'latents': None}
@@ -284,6 +292,27 @@ class LayerDiffusionForA1111(scripts.Script):
             'layerdiffusion_weight': weight,
             'layerdiffusion_ending_step': ending_step,
         })
+
+    def before_process_batch(
+        self,
+        p: StableDiffusionProcessing,
+        enabled,
+        method,
+        weight,
+        ending_step,
+        auto_prompt,
+        resize_mode,
+        output_origin,
+        **kwargs,
+    ):
+        """Runs after each batch's prompts are sliced; must run before extra networks / conditioning."""
+        if not enabled or not auto_prompt:
+            return
+        prompts = kwargs.get('prompts')
+        if not prompts:
+            return
+        batch_number = kwargs.get('batch_number', 0)
+        _apply_transparency_prompts_batch(p, prompts, batch_number)
 
     def post_sample(self, p, ps, enabled, method, weight, ending_step, auto_prompt, resize_mode, output_origin):
         """Called after sampling - latents are now captured via decode wrapper instead."""
